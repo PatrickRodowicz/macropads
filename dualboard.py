@@ -618,7 +618,7 @@ class KeyboardMonitor:
         # Before checking the cache the hook calls _drain_raw_input() which
         # uses PeekMessageW to process any WM_INPUT messages that are already
         # queued — this keeps the cache as fresh as possible.
-        self._last_device_for_vk = {}   # vk (int) → hDevice (int)
+        self._last_device_for_vk = {}   # vk (int) → (hDevice (int), ts (float))
         self._draining = False          # reentrancy guard for PeekMessageW
         # VK codes whose KEYDOWN we blocked — we must block the matching
         # KEYUP too, or the OS thinks the key is still held.
@@ -766,7 +766,7 @@ class KeyboardMonitor:
         # Update the device-per-VK cache (key-down only — a key-up doesn't
         # change which device "owns" the key).
         if not is_up:
-            self._last_device_for_vk[vk] = h_device
+            self._last_device_for_vk[vk] = (h_device, time.perf_counter())
 
         with self._lock:
             is_target = bool(self.target_handles) and h_device in self.target_handles
@@ -833,7 +833,12 @@ class KeyboardMonitor:
         self._drain_raw_input()
 
         # Which device last sent this VK?
-        last_dev = self._last_device_for_vk.get(vk)
+        entry = self._last_device_for_vk.get(vk)
+        last_dev = None
+        if entry is not None:
+            dev, ts = entry
+            if time.perf_counter() - ts < 0.05:  # trust only fresh (<50ms) cache entries
+                last_dev = dev
         with self._lock:
             is_target = (
                 last_dev is not None
@@ -848,6 +853,7 @@ class KeyboardMonitor:
         # It's from the macropad.  Block it.
         if is_down:
             self._blocked_downs.add(vk)
+            self._last_device_for_vk.pop(vk, None)
             if not recording:
                 with self._lock:
                     action = self.mappings.get(vk)
