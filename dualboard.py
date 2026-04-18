@@ -827,7 +827,7 @@ class KeyboardMonitor:
             flags |= KEYEVENTF_EXTENDEDKEY
         inp.union.ki.dwFlags = flags
         inp.union.ki.time = 0
-        inp.union.ki.dwExtraInfo = None
+        inp.union.ki.dwExtraInfo = 0
         user32.SendInput(1, byref(inp), sizeof(INPUT))
 
     def _hook_proc_impl(self, code, wparam, lparam):
