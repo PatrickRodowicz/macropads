@@ -35,7 +35,6 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from collections import deque
 from ctypes import wintypes, POINTER, WINFUNCTYPE, byref, sizeof, Structure
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
@@ -608,19 +607,21 @@ class KeyboardMonitor:
         self._recording = False         # True while the GUI is recording a key
         self._lock = threading.Lock()
 
-        # --- Correlation state (accessed only from the worker thread) ---
+        # --- Device-per-VK cache (accessed only from the worker thread) ---
         #
-        # The low-level keyboard hook fires BEFORE the corresponding WM_INPUT
-        # is dispatched, so we can't know the source device at hook time.
-        # Instead, the hook optimistically blocks any event we *might* want to
-        # handle (mapped keys, or everything while recording), queueing it as
-        # "pending". The raw-input handler runs moments later with the device
-        # identity; it either fires the mapped action (target device) or
-        # re-injects the key via SendInput (non-target device), so keys from
-        # the user's main keyboard still reach their applications.
-        self._pending_hook = deque()    # list of pending blocked events
-        # vk codes whose KEYDOWN we blocked — we must also block the matching
-        # KEYUP regardless of current mode, or the OS keeps the key "stuck".
+        # Blocking a key in the LL hook suppresses the corresponding WM_INPUT
+        # message, so we can't "block first, identify device later". Instead,
+        # we use WM_INPUT from *previous* events to learn which physical
+        # device last sent each VK code, and query that cache inside the hook
+        # to make the block-or-pass decision immediately.
+        #
+        # Before checking the cache the hook calls _drain_raw_input() which
+        # uses PeekMessageW to process any WM_INPUT messages that are already
+        # queued — this keeps the cache as fresh as possible.
+        self._last_device_for_vk = {}   # vk (int) → hDevice (int)
+        self._draining = False          # reentrancy guard for PeekMessageW
+        # VK codes whose KEYDOWN we blocked — we must block the matching
+        # KEYUP too, or the OS thinks the key is still held.
         self._blocked_downs = set()
 
         self._thread = None
@@ -739,6 +740,8 @@ class KeyboardMonitor:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _handle_raw_input(self, hrawinput):
+        """Process a single WM_INPUT event. Updates the device-per-VK cache
+        and fires the on_key_event callback (used for key recording)."""
         size = wintypes.UINT(0)
         user32.GetRawInputData(
             hrawinput, RID_INPUT, None, byref(size), sizeof(RAWINPUTHEADER)
@@ -757,78 +760,43 @@ class KeyboardMonitor:
             return
 
         vk = raw.keyboard.VKey
-        # Raw Input uses the RI_KEY_BREAK bit in Flags for key-up.
         is_up = bool(raw.keyboard.Flags & RI_KEY_BREAK)
         h_device = raw.header.hDevice
 
-        with self._lock:
-            is_target = h_device in self.target_handles
-            recording = self._recording
-            action = self.mappings.get(vk) if not is_up else None
+        # Update the device-per-VK cache (key-down only — a key-up doesn't
+        # change which device "owns" the key).
+        if not is_up:
+            self._last_device_for_vk[vk] = h_device
 
-        # Fire the generic "I saw a key" callback for the GUI (recording,
-        # diagnostics). This runs whether or not we blocked the event.
+        with self._lock:
+            is_target = bool(self.target_handles) and h_device in self.target_handles
+
+        # Notify GUI (recording, diagnostics)
         try:
             self.on_key_event(vk, is_up, is_target, h_device)
         except Exception as e:
             print("on_key_event error:", e)
 
-        # If the hook decided to block this event, it will have queued a
-        # pending entry. Pop the oldest match (FIFO) and act on it now that
-        # we finally know the source device.
-        pend = self._pop_pending(vk, is_up)
-        if pend is None:
-            # Hook let it through — nothing to do.
+    def _drain_raw_input(self):
+        """Pump any pending WM_INPUT messages from the queue (via PeekMessageW)
+        to bring the device cache up to date. Called inside the LL hook so we
+        know the source device before deciding to block or pass.
+
+        A reentrancy guard prevents infinite loops: PeekMessageW can dispatch
+        sent-message callbacks (including another hook invocation), so the
+        nested hook call will simply skip the drain and use the cache as-is."""
+        if self._draining:
             return
-
-        if is_target:
-            # From our macropad. Swallow the key entirely; fire mapped action
-            # on key-down (but not while the GUI is recording a new binding).
-            if not is_up and not recording and action is not None:
-                try:
-                    self.on_blocked_action(vk, action)
-                except Exception as e:
-                    print("on_blocked_action error:", e)
-        else:
-            # Came from another keyboard. We blocked it prematurely — put it
-            # back into the input stream so the user's main keyboard works.
-            self._reinject_key(pend)
-
-    def _pop_pending(self, vk, is_up):
-        """Remove and return the oldest pending entry matching (vk, is_up).
-        Also trims anything older than 500ms (safety net in case a raw-input
-        event is ever lost; prevents the queue from growing unbounded)."""
-        now = time.monotonic()
-        # Trim stale entries by re-injecting them — they were blocked but
-        # we never learned what to do with them, so restoring is the safe bet.
-        stale = []
-        while self._pending_hook and now - self._pending_hook[0]["ts"] > 0.5:
-            stale.append(self._pending_hook.popleft())
-        for s in stale:
-            self._reinject_key(s)
-
-        for i, p in enumerate(self._pending_hook):
-            if p["vk"] == vk and p["is_up"] == is_up:
-                del self._pending_hook[i]
-                return p
-        return None
-
-    def _reinject_key(self, pend):
-        """Re-send a previously-blocked key via SendInput. SendInput sets
-        LLKHF_INJECTED on the resulting event so our own hook ignores it."""
-        inp = INPUT()
-        inp.type = INPUT_KEYBOARD
-        inp.union.ki.wVk = pend["vk"]
-        inp.union.ki.wScan = pend["scan_code"]
-        flags = 0
-        if pend["is_up"]:
-            flags |= KEYEVENTF_KEYUP
-        if pend["flags"] & LLKHF_EXTENDED:
-            flags |= KEYEVENTF_EXTENDEDKEY
-        inp.union.ki.dwFlags = flags
-        inp.union.ki.time = 0
-        inp.union.ki.dwExtraInfo = 0
-        user32.SendInput(1, byref(inp), sizeof(INPUT))
+        self._draining = True
+        try:
+            msg = MSG()
+            # Drain ALL pending WM_INPUT messages for our message-only window.
+            while user32.PeekMessageW(
+                byref(msg), self._hwnd, WM_INPUT, WM_INPUT, PM_REMOVE
+            ):
+                self._handle_raw_input(msg.lParam)
+        finally:
+            self._draining = False
 
     def _hook_proc_impl(self, code, wparam, lparam):
         if code != HC_ACTION:
@@ -847,35 +815,47 @@ class KeyboardMonitor:
 
         vk = kbd.vkCode
 
+        # Fast path: if we blocked this key's KEYDOWN, we *must* also block
+        # its KEYUP — otherwise the OS thinks the key is stuck.
+        if is_up and vk in self._blocked_downs:
+            self._blocked_downs.discard(vk)
+            return 1
+
         with self._lock:
             is_mapped = vk in self.mappings
             recording = self._recording
 
-        # Decide whether to block. We must block the KEYUP for any key whose
-        # KEYDOWN we blocked, even if the mapping/recording state has since
-        # changed — otherwise the OS thinks the key is still held.
-        should_block = False
-        if is_down:
-            if is_mapped or recording:
-                should_block = True
-                self._blocked_downs.add(vk)
-        else:  # key up
-            if vk in self._blocked_downs:
-                should_block = True
-                self._blocked_downs.discard(vk)
-
-        if not should_block:
+        # Only care about mapped keys and keys pressed while recording.
+        if not (is_mapped or recording):
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        # Queue the event; the raw-input handler will fire the action (if
-        # target) or re-inject (if not) within a millisecond or two.
-        self._pending_hook.append({
-            "ts": time.monotonic(),
-            "vk": vk,
-            "is_up": is_up,
-            "scan_code": kbd.scanCode,
-            "flags": kbd.flags,
-        })
+        # Drain any queued WM_INPUT messages so our device cache is fresh.
+        self._drain_raw_input()
+
+        # Which device last sent this VK?
+        last_dev = self._last_device_for_vk.get(vk)
+        with self._lock:
+            is_target = (
+                last_dev is not None
+                and bool(self.target_handles)
+                and last_dev in self.target_handles
+            )
+
+        if not is_target:
+            # Not from the macropad (or no device info yet) — let it through.
+            return user32.CallNextHookEx(self._hook, code, wparam, lparam)
+
+        # It's from the macropad.  Block it.
+        if is_down:
+            self._blocked_downs.add(vk)
+            if not recording:
+                with self._lock:
+                    action = self.mappings.get(vk)
+                if action is not None:
+                    try:
+                        self.on_blocked_action(vk, action)
+                    except Exception as e:
+                        print("on_blocked_action error:", e)
         return 1
 
 
