@@ -28,6 +28,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -296,8 +297,54 @@ def vk_name(vk: int) -> str:
 # =============================================================================
 
 
+# Generic device descriptions we want to see through to find a real name.
+_GENERIC_NAMES = {
+    "hid keyboard device",
+    "hid-compliant keyboard",
+    "hid keyboard",
+    "keyboard device",
+    "usb composite device",
+    "usb input device",
+    "hid-compliant device",
+    "hid-compliant consumer control device",
+    "hid-compliant system controller",
+    "hid-compliant vendor-defined device",
+}
+
+
+def _parse_vid_pid(raw_device_name: str):
+    """Extract VID/PID from a raw device path, or (None, None)."""
+    vm = re.search(r"VID_([0-9A-Fa-f]{4})", raw_device_name)
+    pm = re.search(r"PID_([0-9A-Fa-f]{4})", raw_device_name)
+    return (
+        vm.group(1).upper() if vm else None,
+        pm.group(1).upper() if pm else None,
+    )
+
+
+def _physical_device_key(raw_device_name: str):
+    """
+    A stable key that groups all HID collections belonging to the same
+    physical keyboard. We use VID+PID plus the USB instance/serial portion
+    of the device path (the middle `#` segment, e.g. "7&abc123&0&0000"),
+    which is shared across a device's sibling interfaces.
+    """
+    vid, pid = _parse_vid_pid(raw_device_name)
+    # Device path looks like: \\?\HID#VID_xxxx&PID_xxxx&MI_xx&Col0x#<instance>#{GUID}
+    parts = raw_device_name.split("#")
+    instance = parts[2] if len(parts) >= 3 else ""
+    # Drop the trailing "&0&0000"-style collection suffix to merge siblings.
+    instance_root = instance.rsplit("&", 2)[0] if "&" in instance else instance
+    return (vid, pid, instance_root)
+
+
 def enumerate_keyboards():
-    """Return a list of (device_handle, friendly_name) for all keyboards."""
+    """
+    Return a list of (handles, friendly_name, raw_name) for all keyboards,
+    deduplicated by physical device. `handles` is a tuple of all HID handles
+    belonging to the same physical keyboard (a single keyboard often exposes
+    several HID collections — keyboard, consumer, system control).
+    """
     count = wintypes.UINT(0)
     user32.GetRawInputDeviceList(None, byref(count), sizeof(RAWINPUTDEVICELIST))
     if count.value == 0:
@@ -308,13 +355,16 @@ def enumerate_keyboards():
     if got == 0xFFFFFFFF:
         return []
 
-    results = []
+    # group_key -> { handles: [...], raw_names: [...] }
+    groups = {}
+    group_order = []
+
     for i in range(got):
         dev = devices[i]
         if dev.dwType != RIM_TYPEKEYBOARD:
             continue
 
-        # Get device name (an internal device path; long and ugly)
+        # Get the raw device path
         name_len = wintypes.UINT(0)
         user32.GetRawInputDeviceInfoW(dev.hDevice, RIDI_DEVICENAME, None, byref(name_len))
         if name_len.value == 0:
@@ -325,57 +375,207 @@ def enumerate_keyboards():
         )
         raw_name = name_buf.value
 
-        # Skip RDP / fake keyboards (no VID/PID)
+        # Skip RDP / synthetic keyboards (no VID/PID)
         if "VID_" not in raw_name:
             continue
 
-        friendly = _friendly_name(raw_name)
-        results.append((dev.hDevice, friendly, raw_name))
+        key = _physical_device_key(raw_name)
+        if key not in groups:
+            groups[key] = {"handles": [], "raw_names": []}
+            group_order.append(key)
+        groups[key]["handles"].append(dev.hDevice)
+        groups[key]["raw_names"].append(raw_name)
+
+    results = []
+    for key in group_order:
+        g = groups[key]
+        # Use the first raw_name of the group as the canonical identifier;
+        # try to resolve a friendly name using any of the group's paths.
+        friendly = None
+        for rn in g["raw_names"]:
+            friendly = _friendly_name(rn)
+            if friendly and friendly.lower() not in _GENERIC_NAMES:
+                break
+        friendly = friendly or "Keyboard"
+        results.append((tuple(g["handles"]), friendly, g["raw_names"][0]))
 
     return results
 
 
 def _friendly_name(raw_device_name: str) -> str:
     """
-    Try to get a friendly name from the registry for a raw device name.
-    Falls back to extracting the VID/PID if registry lookup fails.
+    Produce a human-readable name for a raw HID device path. Tries, in order:
+      1. The USB product string descriptor (HidD_GetProductString) — the
+         actual marketing name the device advertises (e.g. "Keychron Q0").
+      2. The HID node's own registry DeviceDesc/FriendlyName.
+      3. The parent USB device's registry DeviceDesc/FriendlyName.
+      4. A VID:PID fallback.
     """
-    # Device name looks like: \\?\HID#VID_05AC&PID_024F&MI_01#7&abcdef#{...}
-    # We can query the registry for a friendly name under SYSTEM\CurrentControlSet\Enum\<id>
+    vid, pid = _parse_vid_pid(raw_device_name)
+
+    candidates = []
+
+    # 1) Ask the device directly.
+    s = _hid_product_string(raw_device_name)
+    if s:
+        candidates.append(s)
+
+    # 2) The HID node's own registry entry (often generic for keyboards).
+    s = _registry_name_for_path(raw_device_name)
+    if s:
+        candidates.append(s)
+
+    # 3) Walk up to the USB parent device, which usually has a real name.
+    if vid and pid:
+        s = _usb_parent_name(vid, pid)
+        if s:
+            candidates.append(s)
+
+    # Pick the first specific (non-generic) candidate.
+    for c in candidates:
+        if c and c.strip().lower() not in _GENERIC_NAMES:
+            return c.strip()
+
+    # Otherwise, take the first non-empty candidate and append VID:PID for
+    # disambiguation between multiple generic keyboards.
+    base = next((c for c in candidates if c), "Keyboard")
+    if vid and pid:
+        return f"{base} (VID:{vid} PID:{pid})"
+    return base
+
+
+def _registry_name_for_path(raw_device_name: str):
+    """Read DeviceDesc/FriendlyName from the HID device's registry key."""
     try:
         import winreg
-
-        # Strip the \\?\ prefix and the {GUID} suffix, convert # to \
-        if raw_device_name.startswith("\\\\?\\"):
-            stripped = raw_device_name[4:]
-        else:
-            stripped = raw_device_name
-
+    except ImportError:
+        return None
+    try:
+        stripped = raw_device_name
+        if stripped.startswith("\\\\?\\"):
+            stripped = stripped[4:]
         if "#{" in stripped:
             stripped = stripped.split("#{")[0]
         reg_path = "SYSTEM\\CurrentControlSet\\Enum\\" + stripped.replace("#", "\\")
-
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as key:
             for value_name in ("FriendlyName", "DeviceDesc"):
                 try:
                     val, _ = winreg.QueryValueEx(key, value_name)
-                    # DeviceDesc looks like "@msft...;HID Keyboard Device" — take last part
+                    # DeviceDesc often looks like "@oem.inf,%key%;Display Name"
                     if ";" in val:
-                        val = val.split(";")[-1]
+                        val = val.split(";", 1)[-1]
                     return val
                 except FileNotFoundError:
                     continue
-    except Exception:
+    except OSError:
         pass
+    return None
 
-    # Fallback: extract VID/PID
-    vid = pid = "????"
-    for part in raw_device_name.split("&"):
-        if part.startswith("VID_"):
-            vid = part[4:8]
-        elif part.startswith("PID_"):
-            pid = part[4:8]
-    return f"HID Keyboard (VID:{vid} PID:{pid})"
+
+def _usb_parent_name(vid: str, pid: str):
+    """
+    Walk SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_xxxx&PID_xxxx\\* and
+    return the first specific DeviceDesc/FriendlyName we find.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return None
+    usb_path = f"SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_{vid}&PID_{pid}"
+    first_generic = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, usb_path) as key:
+            for i in range(256):
+                try:
+                    sub_name = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(key, sub_name) as sub:
+                        for value_name in ("FriendlyName", "DeviceDesc"):
+                            try:
+                                val, _ = winreg.QueryValueEx(sub, value_name)
+                                if ";" in val:
+                                    val = val.split(";", 1)[-1]
+                                val = val.strip()
+                                if not val:
+                                    continue
+                                if val.lower() not in _GENERIC_NAMES:
+                                    return val
+                                if first_generic is None:
+                                    first_generic = val
+                            except FileNotFoundError:
+                                continue
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return first_generic
+
+
+def _hid_product_string(raw_device_name: str):
+    """
+    Open the HID device with zero access (metadata only — doesn't fight
+    exclusive-access games/keyboards) and ask for its USB product string.
+    This is the cleanest source of a human-readable name.
+    """
+    try:
+        hid = ctypes.WinDLL("hid", use_last_error=True)
+    except OSError:
+        return None
+
+    CreateFileW = kernel32.CreateFileW
+    CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    CreateFileW.restype = wintypes.HANDLE
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    h = CreateFileW(
+        raw_device_name, 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None,
+    )
+    if not h or h == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        HidD_GetProductString = hid.HidD_GetProductString
+        HidD_GetProductString.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG
+        ]
+        HidD_GetProductString.restype = wintypes.BOOL
+
+        HidD_GetManufacturerString = hid.HidD_GetManufacturerString
+        HidD_GetManufacturerString.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG
+        ]
+        HidD_GetManufacturerString.restype = wintypes.BOOL
+
+        prod = ctypes.create_unicode_buffer(256)
+        mfr = ctypes.create_unicode_buffer(256)
+        got_prod = bool(HidD_GetProductString(h, prod, sizeof(prod)))
+        got_mfr = bool(HidD_GetManufacturerString(h, mfr, sizeof(mfr)))
+
+        p = prod.value.strip() if got_prod else ""
+        m = mfr.value.strip() if got_mfr else ""
+
+        if p and m and not p.lower().startswith(m.lower()):
+            return f"{m} {p}"
+        if p:
+            return p
+        if m:
+            return m
+        return None
+    finally:
+        CloseHandle(h)
 
 
 # =============================================================================
@@ -396,13 +596,27 @@ class KeyboardMonitor:
         self.on_key_event = on_key_event          # called for EVERY key (for diagnostics)
         self.on_blocked_action = on_blocked_action  # called when a bound key fires
 
-        self.target_handle = None       # HANDLE of the macropad device (or None)
+        # Set of HANDLEs belonging to the target physical keyboard. A single
+        # keyboard often has several HID collections; any of them counts.
+        self.target_handles = set()
         self.mappings = {}              # { vk_code: action_dict }
+        self._recording = False         # True while the GUI is recording a key
         self._lock = threading.Lock()
 
-        # Correlation buffer: recent raw-input events we haven't matched to
-        # a low-level hook event yet. Each entry: (timestamp, vkCode, is_target)
-        self._recent_raw = deque(maxlen=32)
+        # --- Correlation state (accessed only from the worker thread) ---
+        #
+        # The low-level keyboard hook fires BEFORE the corresponding WM_INPUT
+        # is dispatched, so we can't know the source device at hook time.
+        # Instead, the hook optimistically blocks any event we *might* want to
+        # handle (mapped keys, or everything while recording), queueing it as
+        # "pending". The raw-input handler runs moments later with the device
+        # identity; it either fires the mapped action (target device) or
+        # re-injects the key via SendInput (non-target device), so keys from
+        # the user's main keyboard still reach their applications.
+        self._pending_hook = deque()    # list of pending blocked events
+        # vk codes whose KEYDOWN we blocked — we must also block the matching
+        # KEYUP regardless of current mode, or the OS keeps the key "stuck".
+        self._blocked_downs = set()
 
         self._thread = None
         self._thread_id = None
@@ -417,13 +631,26 @@ class KeyboardMonitor:
 
     # ----- Public API (called from GUI thread) -----
 
-    def set_target(self, handle):
+    def set_target(self, handles):
+        """Set the target device's HID handle(s). Accepts an iterable."""
         with self._lock:
-            self.target_handle = handle
+            if handles is None:
+                self.target_handles = set()
+            elif isinstance(handles, (list, tuple, set, frozenset)):
+                self.target_handles = set(handles)
+            else:
+                # Single handle, for backwards compatibility
+                self.target_handles = {handles}
 
     def set_mappings(self, mappings: dict):
         with self._lock:
             self.mappings = dict(mappings)
+
+    def set_recording(self, recording: bool):
+        """Tell the monitor to block every key event (not just mapped ones)
+        while the GUI is capturing a key to assign."""
+        with self._lock:
+            self._recording = bool(recording)
 
     def start(self):
         if self._running:
@@ -525,21 +752,78 @@ class KeyboardMonitor:
             return
 
         vk = raw.keyboard.VKey
+        # Raw Input uses the RI_KEY_BREAK bit in Flags for key-up.
         is_up = bool(raw.keyboard.Flags & RI_KEY_BREAK)
         h_device = raw.header.hDevice
 
         with self._lock:
-            target = self.target_handle
-        is_target = (h_device == target) and target is not None
+            is_target = h_device in self.target_handles
+            recording = self._recording
+            action = self.mappings.get(vk) if not is_up else None
 
-        # Record for correlation with the LL hook event that's about to fire
-        self._recent_raw.append((time.monotonic(), vk, is_up, is_target))
-
-        # Notify GUI (for "recording a key" feature and diagnostics)
+        # Fire the generic "I saw a key" callback for the GUI (recording,
+        # diagnostics). This runs whether or not we blocked the event.
         try:
             self.on_key_event(vk, is_up, is_target, h_device)
         except Exception as e:
             print("on_key_event error:", e)
+
+        # If the hook decided to block this event, it will have queued a
+        # pending entry. Pop the oldest match (FIFO) and act on it now that
+        # we finally know the source device.
+        pend = self._pop_pending(vk, is_up)
+        if pend is None:
+            # Hook let it through — nothing to do.
+            return
+
+        if is_target:
+            # From our macropad. Swallow the key entirely; fire mapped action
+            # on key-down (but not while the GUI is recording a new binding).
+            if not is_up and not recording and action is not None:
+                try:
+                    self.on_blocked_action(vk, action)
+                except Exception as e:
+                    print("on_blocked_action error:", e)
+        else:
+            # Came from another keyboard. We blocked it prematurely — put it
+            # back into the input stream so the user's main keyboard works.
+            self._reinject_key(pend)
+
+    def _pop_pending(self, vk, is_up):
+        """Remove and return the oldest pending entry matching (vk, is_up).
+        Also trims anything older than 500ms (safety net in case a raw-input
+        event is ever lost; prevents the queue from growing unbounded)."""
+        now = time.monotonic()
+        # Trim stale entries by re-injecting them — they were blocked but
+        # we never learned what to do with them, so restoring is the safe bet.
+        stale = []
+        while self._pending_hook and now - self._pending_hook[0]["ts"] > 0.5:
+            stale.append(self._pending_hook.popleft())
+        for s in stale:
+            self._reinject_key(s)
+
+        for i, p in enumerate(self._pending_hook):
+            if p["vk"] == vk and p["is_up"] == is_up:
+                del self._pending_hook[i]
+                return p
+        return None
+
+    def _reinject_key(self, pend):
+        """Re-send a previously-blocked key via SendInput. SendInput sets
+        LLKHF_INJECTED on the resulting event so our own hook ignores it."""
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.union.ki.wVk = pend["vk"]
+        inp.union.ki.wScan = pend["scan_code"]
+        flags = 0
+        if pend["is_up"]:
+            flags |= KEYEVENTF_KEYUP
+        if pend["flags"] & LLKHF_EXTENDED:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        inp.union.ki.dwFlags = flags
+        inp.union.ki.time = 0
+        inp.union.ki.dwExtraInfo = None
+        user32.SendInput(1, byref(inp), sizeof(INPUT))
 
     def _hook_proc_impl(self, code, wparam, lparam):
         if code != HC_ACTION:
@@ -547,7 +831,7 @@ class KeyboardMonitor:
 
         kbd = ctypes.cast(lparam, POINTER(KBDLLHOOKSTRUCT))[0]
 
-        # Ignore events we synthesized ourselves
+        # Ignore events we (or anyone else) synthesized.
         if kbd.flags & LLKHF_INJECTED:
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
@@ -558,42 +842,36 @@ class KeyboardMonitor:
 
         vk = kbd.vkCode
 
-        # Find the most recent matching raw-input event (within 100ms)
-        now = time.monotonic()
-        match = None
-        for i in range(len(self._recent_raw) - 1, -1, -1):
-            ts, raw_vk, raw_up, raw_is_target = self._recent_raw[i]
-            if now - ts > 0.1:
-                break
-            if raw_vk == vk and raw_up == is_up:
-                match = (i, raw_is_target)
-                break
+        with self._lock:
+            is_mapped = vk in self.mappings
+            recording = self._recording
 
-        if match is not None:
-            idx, is_target = match
-            # Consume the matched entry
-            try:
-                del self._recent_raw[idx]
-            except IndexError:
-                pass
-        else:
-            # No raw input seen yet — pass through (safer default)
-            is_target = False
+        # Decide whether to block. We must block the KEYUP for any key whose
+        # KEYDOWN we blocked, even if the mapping/recording state has since
+        # changed — otherwise the OS thinks the key is still held.
+        should_block = False
+        if is_down:
+            if is_mapped or recording:
+                should_block = True
+                self._blocked_downs.add(vk)
+        else:  # key up
+            if vk in self._blocked_downs:
+                should_block = True
+                self._blocked_downs.discard(vk)
 
-        if is_target:
-            with self._lock:
-                action = self.mappings.get(vk)
-            if action is not None:
-                # Only trigger on key down (not up) for single-shot actions
-                if is_down:
-                    try:
-                        self.on_blocked_action(vk, action)
-                    except Exception as e:
-                        print("on_blocked_action error:", e)
-                # Block the key entirely (both down and up)
-                return 1
+        if not should_block:
+            return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        return user32.CallNextHookEx(self._hook, code, wparam, lparam)
+        # Queue the event; the raw-input handler will fire the action (if
+        # target) or re-inject (if not) within a millisecond or two.
+        self._pending_hook.append({
+            "ts": time.monotonic(),
+            "vk": vk,
+            "is_up": is_up,
+            "scan_code": kbd.scanCode,
+            "flags": kbd.flags,
+        })
+        return 1
 
 
 # =============================================================================
@@ -998,8 +1276,8 @@ class DualBoardApp:
         idx = self.device_combo.current()
         if idx < 0 or idx >= len(self.devices):
             return
-        handle, friendly, raw = self.devices[idx]
-        self.monitor.set_target(handle)
+        handles, friendly, raw = self.devices[idx]
+        self.monitor.set_target(handles)
         self.config["device_raw_name"] = raw
         save_config(self.config)
         self.status_var.set(f"Target: {friendly}")
@@ -1100,6 +1378,11 @@ class DualBoardApp:
         """Called by ActionDialog to request the next keypress."""
         with self._recording_lock:
             self._recording_cb = cb
+        # Tell the monitor to block every key while we're capturing one,
+        # not just mapped keys — otherwise the key the user presses during
+        # recording reaches applications (annoying) or, if it's a mapped
+        # key being re-recorded, fires its old action.
+        self.monitor.set_recording(cb is not None)
         # Ensure monitor is running so we can see keys during recording
         if cb is not None and not self._running:
             # Start in recording-only mode (empty mappings means nothing is blocked)
