@@ -607,24 +607,31 @@ class KeyboardMonitor:
         self._recording = False         # True while the GUI is recording a key
         self._lock = threading.Lock()
 
-        # --- Device-per-VK cache with confirmation tracking ---
+        # --- Device tracking (accessed only from the worker thread) ---
         #
-        # Blocking a key in the LL hook MAY suppress the corresponding WM_INPUT,
-        # which means the cache can get stuck: once a VK is cached as "target",
-        # pressing it on the main keyboard would block it, suppress WM_INPUT, and
-        # the cache never corrects.
+        # Blocking a key in the LL hook suppresses WM_INPUT for that keystroke,
+        # so the per-VK cache can get stuck.  Two pieces of state solve this:
         #
-        # Fix: each cache entry has a "confirmed" flag. WM_INPUT sets it True.
-        # After blocking, we set it False. On the next hook call:
-        #   - confirmed=True  → safe to block (WM_INPUT confirmed the device)
-        #   - confirmed=False → let it through so WM_INPUT can re-identify the device
+        # _device_cache  – vk → hDevice from the most recent WM_INPUT for that
+        #                  VK.  Only updated when a key is NOT blocked (pass-
+        #                  through or non-mapped), so the entry is always from
+        #                  the REAL device.
         #
-        # Best case (WM_INPUT not suppressed): every block is immediately
-        # re-confirmed, so every press blocks. 100% accuracy.
+        # _last_any_device – hDevice from the most recent WM_INPUT for ANY key.
+        #                    Answers "which keyboard has the user been typing on
+        #                    most recently?"  When this points to the macropad,
+        #                    we trust per-VK cache entries that say "target."
+        #                    When it points to the main keyboard, we DON'T trust
+        #                    "target" entries (because the user may have switched)
+        #                    and instead let the key through so WM_INPUT can
+        #                    refresh the cache with the real device.
         #
-        # Worst case (WM_INPUT suppressed): alternating block/pass-through
-        # (self-healing, never permanently stuck).
-        self._device_cache = {}         # vk (int) → [hDevice, confirmed (bool)]
+        # This eliminates the alternating block/pass-through problem: during
+        # macropad-only use, _last_any_device stays "macropad" and every press
+        # blocks.  After typing on the main keyboard, _last_any_device flips,
+        # stale cache entries are distrusted, and one pass-through corrects them.
+        self._device_cache = {}         # vk (int) → hDevice
+        self._last_any_device = None    # hDevice of the last WM_INPUT event
         self._draining = False          # reentrancy guard for PeekMessageW
         # VK codes whose KEYDOWN we blocked — we must block the matching
         # KEYUP too, or the OS thinks the key is still held.
@@ -746,8 +753,8 @@ class KeyboardMonitor:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _handle_raw_input(self, hrawinput):
-        """Process a single WM_INPUT event. Updates the device cache (with
-        confirmed=True) and fires the on_key_event callback."""
+        """Process a single WM_INPUT event. Updates the device cache and
+        fires the on_key_event callback."""
         size = wintypes.UINT(0)
         user32.GetRawInputData(
             hrawinput, RID_INPUT, None, byref(size), sizeof(RAWINPUTHEADER)
@@ -769,10 +776,11 @@ class KeyboardMonitor:
         is_up = bool(raw.keyboard.Flags & RI_KEY_BREAK)
         h_device = raw.header.hDevice
 
-        # Update the device cache on key-down with confirmed=True.
-        # This is the authoritative source of "which device owns this VK".
+        # Update BOTH caches on key-down. WM_INPUT only arrives for keys
+        # we did NOT block, so this data is always truthful.
         if not is_up:
-            self._device_cache[vk] = [h_device, True]
+            self._device_cache[vk] = h_device
+            self._last_any_device = h_device
 
         with self._lock:
             is_target = bool(self.target_handles) and h_device in self.target_handles
@@ -841,40 +849,51 @@ class KeyboardMonitor:
         # Try to drain any queued WM_INPUT messages to freshen the cache.
         self._drain_raw_input()
 
-        # Check the device cache for this VK.
-        entry = self._device_cache.get(vk)
-        if entry is None:
+        # Check the per-VK device cache.
+        cached_device = self._device_cache.get(vk)
+        if cached_device is None:
             # Cache cold — never seen this VK before. Let it through so
             # WM_INPUT arrives and populates the cache for next time.
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        cached_device, confirmed = entry
-
         with self._lock:
-            is_target = (
-                cached_device is not None
-                and bool(self.target_handles)
+            cache_says_target = (
+                bool(self.target_handles)
                 and cached_device in self.target_handles
             )
 
-        if not is_target:
-            # Cache says this VK belongs to a non-target device — pass through.
+        if not cache_says_target:
+            # Cache says this VK last came from a non-target device.
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        if not confirmed:
-            # Cache says target but it's UNCONFIRMED — a previous block may
-            # have suppressed WM_INPUT, leaving stale data. Let this one
-            # through so WM_INPUT can refresh the cache with the real device.
+        # Cache says target. But can we trust it?  Blocking suppresses
+        # WM_INPUT, so the cache might be stale from an earlier macropad
+        # press while the CURRENT press is actually from the main keyboard.
+        #
+        # Heuristic: check _last_any_device (the device behind the most
+        # recent WM_INPUT from ANY key).  If the user has been typing on
+        # the main keyboard, _last_any_device points there, and we should
+        # NOT trust stale per-VK "target" entries — let this key through
+        # so WM_INPUT can refresh the cache with the real device.
+        #
+        # If _last_any_device still points to the macropad (no main-kb
+        # activity since the cache was written), it's safe to block.
+        with self._lock:
+            last_any_is_target = (
+                self._last_any_device is not None
+                and bool(self.target_handles)
+                and self._last_any_device in self.target_handles
+            )
+
+        if not last_any_is_target:
+            # Recent input was from a non-target device (or unknown).
+            # Don't trust the per-VK cache — let through for a refresh.
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        # Cache says target AND it's confirmed by a recent WM_INPUT. Block it.
+        # Both the per-VK cache and the global device tracker agree: this
+        # key belongs to the macropad.  Block it.
         if is_down:
             self._blocked_downs.add(vk)
-            # Mark the cache as unconfirmed. If WM_INPUT arrives (not
-            # suppressed by the block), it will re-confirm immediately
-            # and the next press blocks too. If WM_INPUT IS suppressed,
-            # the next press will pass through (self-healing).
-            entry[1] = False
             with self._lock:
                 action = self.mappings.get(vk)
             if action is not None:
