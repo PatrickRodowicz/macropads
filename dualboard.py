@@ -583,67 +583,74 @@ def _hid_product_string(raw_device_name: str):
 
 
 # =============================================================================
-# Keyboard monitor (runs in a dedicated worker thread)
+# Keyboard monitor (two threads: raw-input + LL hook)
 # =============================================================================
 
 
 class KeyboardMonitor:
     """
-    Runs a Win32 message pump on a dedicated thread. Registers for Raw Input
-    (to identify device) and installs a low-level keyboard hook (to intercept).
+    Uses two dedicated worker threads to correlate device identity with
+    keystroke interception:
 
-    When a key from the target device fires, it's blocked and a callback is
-    invoked on the worker thread — the callback should queue work for the GUI.
+      Thread A (raw input): creates a message-only window, registers for
+        Raw Input (RIDEV_INPUTSINK), and runs a tight PeekMessageW loop.
+        Every WM_INPUT updates a shared dict mapping VK → device handle.
+
+      Thread B (LL hook): installs a low-level keyboard hook.  For mapped
+        keys, it clears the shared dict entry for that VK, then spin-waits
+        (releasing the GIL each iteration) until Thread A re-populates it
+        from the WM_INPUT that the OS posts for the current keystroke.
+        Once the device is identified the hook blocks or passes through.
+
+    This two-thread design solves the fundamental timing problem: on a
+    single thread the hook callback runs synchronously and can't pump
+    messages, so WM_INPUT is never processed in time.  With two threads
+    the raw-input pump runs independently and the GIL-releasing sleep
+    in the spin-wait lets it interleave with the hook.
     """
 
-    def __init__(self, on_key_event, on_blocked_action):
-        self.on_key_event = on_key_event          # called for EVERY key (for diagnostics)
-        self.on_blocked_action = on_blocked_action  # called when a bound key fires
+    # How long the hook will spin-wait for Thread A to identify the device.
+    # 10 ms is imperceptible to the user and well within the OS's hook
+    # timeout (default 200–300 ms).  In practice the wait is < 1 ms.
+    DEVICE_WAIT_TIMEOUT = 0.010
 
-        # Set of HANDLEs belonging to the target physical keyboard. A single
-        # keyboard often has several HID collections; any of them counts.
+    # How often Thread A polls for WM_INPUT when the queue is empty.
+    RAW_POLL_INTERVAL = 0.0002  # 200 µs
+
+    # How long the hook's spin-wait sleeps on each iteration (releases
+    # the GIL so Thread A can run).
+    HOOK_SPIN_SLEEP = 0.0005  # 500 µs
+
+    def __init__(self, on_key_event, on_blocked_action):
+        self.on_key_event = on_key_event
+        self.on_blocked_action = on_blocked_action
+
         self.target_handles = set()
-        self.mappings = {}              # { vk_code: action_dict }
-        self._recording = False         # True while the GUI is recording a key
+        self.mappings = {}
+        self._recording = False
         self._lock = threading.Lock()
 
-        # --- Device tracking (accessed only from the worker thread) ---
-        #
-        # Blocking a key in the LL hook suppresses WM_INPUT for that keystroke,
-        # so the per-VK cache can get stuck.  Two pieces of state solve this:
-        #
-        # _device_cache  – vk → hDevice from the most recent WM_INPUT for that
-        #                  VK.  Only updated when a key is NOT blocked (pass-
-        #                  through or non-mapped), so the entry is always from
-        #                  the REAL device.
-        #
-        # _last_any_device – hDevice from the most recent WM_INPUT for ANY key.
-        #                    Answers "which keyboard has the user been typing on
-        #                    most recently?"  When this points to the macropad,
-        #                    we trust per-VK cache entries that say "target."
-        #                    When it points to the main keyboard, we DON'T trust
-        #                    "target" entries (because the user may have switched)
-        #                    and instead let the key through so WM_INPUT can
-        #                    refresh the cache with the real device.
-        #
-        # This eliminates the alternating block/pass-through problem: during
-        # macropad-only use, _last_any_device stays "macropad" and every press
-        # blocks.  After typing on the main keyboard, _last_any_device flips,
-        # stale cache entries are distrusted, and one pass-through corrects them.
-        self._device_cache = {}         # vk (int) → hDevice
-        self._last_any_device = None    # hDevice of the last WM_INPUT event
-        self._draining = False          # reentrancy guard for PeekMessageW
+        # Shared device map: vk (int) → hDevice (HANDLE).
+        # Thread A WRITES entries (from WM_INPUT).
+        # Thread B READS and DELETES entries (from the hook).
+        # Under CPython the GIL makes individual dict ops atomic.
+        self._device_for_vk = {}
+
         # VK codes whose KEYDOWN we blocked — we must block the matching
         # KEYUP too, or the OS thinks the key is still held.
         self._blocked_downs = set()
 
-        self._thread = None
-        self._thread_id = None
-        self._hwnd = None
-        self._hook = None
-        self._running = False
+        self._raw_thread = None
+        self._raw_thread_id = None
+        self._ri_hwnd = None
 
-        # Keep strong refs so GC doesn't eat our callbacks
+        self._hook_thread = None
+        self._hook_thread_id = None
+        self._hook = None
+
+        self._running = False
+        self._raw_ready = threading.Event()
+
         self._wnd_proc = WNDPROC(self._wnd_proc_impl)
         self._hook_proc = HOOKPROC(self._hook_proc_impl)
         self._atom = None
@@ -651,14 +658,12 @@ class KeyboardMonitor:
     # ----- Public API (called from GUI thread) -----
 
     def set_target(self, handles):
-        """Set the target device's HID handle(s). Accepts an iterable."""
         with self._lock:
             if handles is None:
                 self.target_handles = set()
             elif isinstance(handles, (list, tuple, set, frozenset)):
                 self.target_handles = set(handles)
             else:
-                # Single handle, for backwards compatibility
                 self.target_handles = {handles}
 
     def set_mappings(self, mappings: dict):
@@ -666,8 +671,6 @@ class KeyboardMonitor:
             self.mappings = dict(mappings)
 
     def set_recording(self, recording: bool):
-        """Tell the monitor to block every key event (not just mapped ones)
-        while the GUI is capturing a key to assign."""
         with self._lock:
             self._recording = bool(recording)
 
@@ -675,86 +678,102 @@ class KeyboardMonitor:
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="DualBoard-Monitor")
-        self._thread.start()
+        self._raw_ready.clear()
+
+        # Start Thread A (raw input) first so it's ready before the hook.
+        self._raw_thread = threading.Thread(
+            target=self._run_raw_input, daemon=True, name="DualBoard-RawInput",
+        )
+        self._raw_thread.start()
+        self._raw_ready.wait(timeout=3.0)
+
+        # Start Thread B (LL hook).
+        self._hook_thread = threading.Thread(
+            target=self._run_hook, daemon=True, name="DualBoard-Hook",
+        )
+        self._hook_thread.start()
 
     def stop(self):
         if not self._running:
             return
         self._running = False
-        if self._thread_id is not None:
-            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._thread = None
-        self._thread_id = None
+        if self._hook_thread_id is not None:
+            user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
+        if self._raw_thread_id is not None:
+            user32.PostThreadMessageW(self._raw_thread_id, WM_QUIT, 0, 0)
+        if self._hook_thread is not None:
+            self._hook_thread.join(timeout=2.0)
+        if self._raw_thread is not None:
+            self._raw_thread.join(timeout=2.0)
+        self._hook_thread = None
+        self._raw_thread = None
+        self._hook_thread_id = None
+        self._raw_thread_id = None
 
-    # ----- Worker thread -----
+    # ----- Thread A: Raw Input processing -----
 
-    def _run(self):
-        self._thread_id = kernel32.GetCurrentThreadId()
+    def _run_raw_input(self):
+        """Dedicated thread for receiving WM_INPUT and populating _device_for_vk."""
+        self._raw_thread_id = kernel32.GetCurrentThreadId()
 
-        # Create a message-only window to receive WM_INPUT
         hinst = kernel32.GetModuleHandleW(None)
         wc = WNDCLASS()
         wc.lpfnWndProc = ctypes.cast(self._wnd_proc, ctypes.c_void_p).value
         wc.hInstance = hinst
-        wc.lpszClassName = "DualBoardMsgWindow"
+        wc.lpszClassName = "DualBoardRawInputWindow"
         self._atom = user32.RegisterClassW(byref(wc))
 
-        self._hwnd = user32.CreateWindowExW(
-            0, "DualBoardMsgWindow", "DualBoard", 0,
+        self._ri_hwnd = user32.CreateWindowExW(
+            0, "DualBoardRawInputWindow", "DualBoard-RI", 0,
             0, 0, 0, 0, HWND_MESSAGE, None, hinst, None,
         )
-        if not self._hwnd:
+        if not self._ri_hwnd:
             print("CreateWindowExW failed:", ctypes.get_last_error())
+            self._raw_ready.set()
             return
 
-        # Register for keyboard raw input
         rid = RAWINPUTDEVICE()
         rid.usUsagePage = 0x01
         rid.usUsage = 0x06
         rid.dwFlags = RIDEV_INPUTSINK
-        rid.hwndTarget = self._hwnd
+        rid.hwndTarget = self._ri_hwnd
         if not user32.RegisterRawInputDevices(byref(rid), 1, sizeof(RAWINPUTDEVICE)):
             print("RegisterRawInputDevices failed:", ctypes.get_last_error())
 
-        # Install low-level keyboard hook
-        self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc, hinst, 0)
-        if not self._hook:
-            print("SetWindowsHookExW failed:", ctypes.get_last_error())
+        self._raw_ready.set()
 
-        # Message pump
+        # Tight poll loop — releases the GIL on each sleep so the hook
+        # thread can run between polls.
         msg = MSG()
-        while True:
-            ret = user32.GetMessageW(byref(msg), None, 0, 0)
-            if ret == 0 or ret == -1:
+        while self._running:
+            found = False
+            while user32.PeekMessageW(
+                byref(msg), self._ri_hwnd, WM_INPUT, WM_INPUT, PM_REMOVE
+            ):
+                self._handle_raw_input(msg.lParam)
+                found = True
+            # Also drain WM_QUIT
+            if user32.PeekMessageW(byref(msg), None, WM_QUIT, WM_QUIT, PM_REMOVE):
                 break
-            user32.TranslateMessage(byref(msg))
-            user32.DispatchMessageW(byref(msg))
+            if not found:
+                time.sleep(self.RAW_POLL_INTERVAL)
 
         # Cleanup
-        if self._hook:
-            user32.UnhookWindowsHookEx(self._hook)
-            self._hook = None
-
-        # Unregister raw input
         rid.dwFlags = RIDEV_REMOVE
         rid.hwndTarget = None
         user32.RegisterRawInputDevices(byref(rid), 1, sizeof(RAWINPUTDEVICE))
-
-        if self._hwnd:
-            user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
+        if self._ri_hwnd:
+            user32.DestroyWindow(self._ri_hwnd)
+            self._ri_hwnd = None
 
     def _wnd_proc_impl(self, hwnd, msg, wparam, lparam):
+        # WM_INPUT is handled directly via PeekMessageW in _run_raw_input,
+        # but handle it here too in case DispatchMessage delivers one.
         if msg == WM_INPUT:
             self._handle_raw_input(lparam)
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _handle_raw_input(self, hrawinput):
-        """Process a single WM_INPUT event. Updates the device cache and
-        fires the on_key_event callback."""
         size = wintypes.UINT(0)
         user32.GetRawInputData(
             hrawinput, RID_INPUT, None, byref(size), sizeof(RAWINPUTHEADER)
@@ -776,39 +795,42 @@ class KeyboardMonitor:
         is_up = bool(raw.keyboard.Flags & RI_KEY_BREAK)
         h_device = raw.header.hDevice
 
-        # Update BOTH caches on key-down. WM_INPUT only arrives for keys
-        # we did NOT block, so this data is always truthful.
+        # Update the shared device map (key-down only).
         if not is_up:
-            self._device_cache[vk] = h_device
-            self._last_any_device = h_device
+            self._device_for_vk[vk] = h_device
 
         with self._lock:
             is_target = bool(self.target_handles) and h_device in self.target_handles
 
-        # Notify GUI (recording, diagnostics)
         try:
             self.on_key_event(vk, is_up, is_target, h_device)
         except Exception as e:
             print("on_key_event error:", e)
 
-    def _drain_raw_input(self):
-        """Pump any pending WM_INPUT messages from the queue (via PeekMessageW)
-        to bring the device cache up to date. Called inside the LL hook.
+    # ----- Thread B: Low-level keyboard hook -----
 
-        A reentrancy guard prevents infinite loops: PeekMessageW can dispatch
-        sent-message callbacks (including another hook invocation), so the
-        nested hook call will simply skip the drain and use the cache as-is."""
-        if self._draining:
+    def _run_hook(self):
+        """Dedicated thread for the LL keyboard hook."""
+        self._hook_thread_id = kernel32.GetCurrentThreadId()
+        hinst = kernel32.GetModuleHandleW(None)
+        self._hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc, hinst, 0,
+        )
+        if not self._hook:
+            print("SetWindowsHookExW failed:", ctypes.get_last_error())
             return
-        self._draining = True
-        try:
-            msg = MSG()
-            while user32.PeekMessageW(
-                byref(msg), self._hwnd, WM_INPUT, WM_INPUT, PM_REMOVE
-            ):
-                self._handle_raw_input(msg.lParam)
-        finally:
-            self._draining = False
+
+        msg = MSG()
+        while True:
+            ret = user32.GetMessageW(byref(msg), None, 0, 0)
+            if ret == 0 or ret == -1:
+                break
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+
+        if self._hook:
+            user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
 
     def _hook_proc_impl(self, code, wparam, lparam):
         if code != HC_ACTION:
@@ -816,7 +838,6 @@ class KeyboardMonitor:
 
         kbd = ctypes.cast(lparam, POINTER(KBDLLHOOKSTRUCT))[0]
 
-        # Ignore events we (or anyone else) synthesized.
         if kbd.flags & LLKHF_INJECTED:
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
@@ -827,8 +848,7 @@ class KeyboardMonitor:
 
         vk = kbd.vkCode
 
-        # Fast path: if we blocked this key's KEYDOWN, we *must* also block
-        # its KEYUP — otherwise the OS thinks the key is stuck.
+        # Always block KEYUP for keys whose KEYDOWN we blocked.
         if is_up and vk in self._blocked_downs:
             self._blocked_downs.discard(vk)
             return 1
@@ -837,61 +857,40 @@ class KeyboardMonitor:
             is_mapped = vk in self.mappings
             recording = self._recording
 
-        # During recording, NEVER block — we need WM_INPUT to arrive so we
-        # can identify which device the key came from.
         if recording:
+            # During recording don't block — we need WM_INPUT for device id.
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        # Only intercept mapped keys.
         if not is_mapped:
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        # Try to drain any queued WM_INPUT messages to freshen the cache.
-        self._drain_raw_input()
+        # ---- Spin-wait for device identification ----
+        #
+        # Clear any stale entry so we only match a FRESH WM_INPUT from
+        # Thread A that corresponds to this keystroke.
+        self._device_for_vk.pop(vk, None)
 
-        # Check the per-VK device cache.
-        cached_device = self._device_cache.get(vk)
-        if cached_device is None:
-            # Cache cold — never seen this VK before. Let it through so
-            # WM_INPUT arrives and populates the cache for next time.
+        deadline = time.monotonic() + self.DEVICE_WAIT_TIMEOUT
+        device = None
+        while time.monotonic() < deadline:
+            device = self._device_for_vk.get(vk)
+            if device is not None:
+                break
+            # Release the GIL so Thread A can acquire it and process
+            # the WM_INPUT that the OS just posted.
+            time.sleep(self.HOOK_SPIN_SLEEP)
+
+        if device is None:
+            # Timeout — couldn't identify device.  Pass through (safe).
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
         with self._lock:
-            cache_says_target = (
-                bool(self.target_handles)
-                and cached_device in self.target_handles
-            )
+            is_target = bool(self.target_handles) and device in self.target_handles
 
-        if not cache_says_target:
-            # Cache says this VK last came from a non-target device.
+        if not is_target:
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
-        # Cache says target. But can we trust it?  Blocking suppresses
-        # WM_INPUT, so the cache might be stale from an earlier macropad
-        # press while the CURRENT press is actually from the main keyboard.
-        #
-        # Heuristic: check _last_any_device (the device behind the most
-        # recent WM_INPUT from ANY key).  If the user has been typing on
-        # the main keyboard, _last_any_device points there, and we should
-        # NOT trust stale per-VK "target" entries — let this key through
-        # so WM_INPUT can refresh the cache with the real device.
-        #
-        # If _last_any_device still points to the macropad (no main-kb
-        # activity since the cache was written), it's safe to block.
-        with self._lock:
-            last_any_is_target = (
-                self._last_any_device is not None
-                and bool(self.target_handles)
-                and self._last_any_device in self.target_handles
-            )
-
-        if not last_any_is_target:
-            # Recent input was from a non-target device (or unknown).
-            # Don't trust the per-VK cache — let through for a refresh.
-            return user32.CallNextHookEx(self._hook, code, wparam, lparam)
-
-        # Both the per-VK cache and the global device tracker agree: this
-        # key belongs to the macropad.  Block it.
+        # It's from the macropad — block it and fire the action.
         if is_down:
             self._blocked_downs.add(vk)
             with self._lock:
